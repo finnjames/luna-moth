@@ -78,7 +78,7 @@ impl DecDialog {
         core.beep(current_time);
 
         // Read just the declination value
-        let Some(new_dec) = core.latest_declinometer_reading else {
+        let Some(new_dec) = core.latest_declinometer_reading() else {
             self.warning = Some("Warning: no reading from the declinometer".to_owned());
             return;
         };

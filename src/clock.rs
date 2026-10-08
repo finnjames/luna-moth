@@ -66,6 +66,28 @@ pub fn time_slug() -> String {
     Local::now().format("%Y.%m.%d-%H.%M").to_string()
 }
 
+/// The local time of day of a solar time, as HH:MM:SS
+pub fn local_time_of_day(epoch_time: f64) -> String {
+    chrono::DateTime::from_timestamp(epoch_time as i64, 0)
+        .unwrap_or_default()
+        .with_timezone(&Local)
+        .format("%H:%M:%S")
+        .to_string()
+}
+
+/// Format a length of time in seconds as e.g. "45s", "12m 05s", or "1h 02m"
+pub fn format_duration(seconds: f64) -> String {
+    let total = seconds.max(0.0).round() as u64;
+    let (hours, minutes, seconds) = (total / 3600, total / 60 % 60, total % 60);
+    if hours > 0 {
+        format!("{hours}h {minutes:02}m")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
 /// Handle to a timer owned by a [`SuperClock`]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TimerId(usize);
@@ -186,6 +208,14 @@ mod tests {
         Utc.with_ymd_and_hms(y, mo, d, h, mi, s)
             .unwrap()
             .timestamp() as f64
+    }
+
+    #[test]
+    fn formats_durations() {
+        assert_eq!(format_duration(44.6), "45s");
+        assert_eq!(format_duration(725.0), "12m 05s");
+        assert_eq!(format_duration(3720.0), "1h 02m");
+        assert_eq!(format_duration(-5.0), "0s");
     }
 
     #[test]

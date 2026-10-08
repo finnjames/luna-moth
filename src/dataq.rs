@@ -128,24 +128,28 @@ impl DataQ {
     /// Use this as a real-time sampling method. Each datapoint has two channels:
     /// channel 0: telescope channel A
     /// channel 1: telescope channel B
-    pub fn read_latest(&mut self, current_time: f64, sim: &SimParams) -> Option<SignalDatum> {
+    pub fn read_latest(
+        &mut self,
+        current_time: f64,
+        sim: &SimParams,
+    ) -> io::Result<Option<SignalDatum>> {
         let Some(ser) = &mut self.ser else {
-            return Some(random_data(current_time, sim));
+            return Ok(Some(random_data(current_time, sim)));
         };
 
         // Data is always read in whole points; otherwise there's no way to tell the
         // channels apart.
-        let available = ser.bytes_to_read().ok()? as usize;
+        let available = ser.bytes_to_read()? as usize;
         let mut buffer = vec![0; available / DATUM_SIZE * DATUM_SIZE];
         if buffer.is_empty() {
-            return None;
+            return Ok(None);
         }
-        ser.read_exact(&mut buffer).ok()?;
+        ser.read_exact(&mut buffer)?;
         let latest = &buffer[buffer.len() - DATUM_SIZE..];
-        Some(SignalDatum {
+        Ok(Some(SignalDatum {
             a: convert([latest[0], latest[1]], CHANNELS[0]),
             b: convert([latest[2], latest[3]], CHANNELS[1]),
-        })
+        }))
     }
 
     // Helpers
@@ -227,13 +231,13 @@ mod tests {
             polarization: 0,
             ..SimParams::default()
         };
-        let datum = dataq.read_latest(1000.0, &quiet).unwrap();
+        let datum = dataq.read_latest(1000.0, &quiet).unwrap().unwrap();
         assert_eq!(datum.a, datum.b); // No polarization means identical channels
         let calibrating = SimParams {
             calibration: true,
             ..quiet
         };
-        let raised = dataq.read_latest(1000.0, &calibrating).unwrap();
+        let raised = dataq.read_latest(1000.0, &calibrating).unwrap().unwrap();
         assert!(raised.a > datum.a + 1.0);
     }
 }

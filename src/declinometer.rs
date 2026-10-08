@@ -54,18 +54,18 @@ impl Declinometer {
 
     /// This function reads the last angle from the buffer and clears the buffer.
     /// Use this as a real-time sampling method.
-    pub fn read_latest(&mut self, current_time: f64, sim: &SimParams) -> Option<f64> {
+    pub fn read_latest(&mut self, current_time: f64, sim: &SimParams) -> io::Result<Option<f64>> {
         let Some(ser) = &mut self.ser else {
-            return Some(random_data(current_time, sim));
+            return Ok(Some(random_data(current_time, sim)));
         };
 
-        let available = ser.bytes_to_read().ok()? as usize;
+        let available = ser.bytes_to_read()? as usize;
         if available == 0 {
-            return None;
+            return Ok(None);
         }
         let mut buffer = vec![0; available];
-        ser.read_exact(&mut buffer).ok()?;
-        latest_angle(&mut self.line, &buffer)
+        ser.read_exact(&mut buffer)?;
+        Ok(latest_angle(&mut self.line, &buffer))
     }
 }
 
@@ -129,10 +129,12 @@ mod tests {
             declination: 0.42,
             ..SimParams::default()
         };
-        assert_eq!(declinometer.read_latest(0.0, &manual), Some(0.42));
+        assert_eq!(declinometer.read_latest(0.0, &manual).unwrap(), Some(0.42));
         let auto = SimParams::default();
         assert_eq!(
-            declinometer.read_latest(std::f64::consts::PI, &auto),
+            declinometer
+                .read_latest(std::f64::consts::PI, &auto)
+                .unwrap(),
             Some(1.0)
         );
     }

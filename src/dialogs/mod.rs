@@ -3,7 +3,7 @@
 use eframe::egui;
 
 use crate::clock::hms_to_seconds;
-use crate::core::{Alert, Core};
+use crate::core::Core;
 
 mod dec;
 mod obs;
@@ -59,7 +59,7 @@ fn message_label(ui: &mut egui::Ui, message: &str, color: egui::Color32) {
     });
 }
 
-const DARK_ORANGE: egui::Color32 = egui::Color32::from_rgb(0xFF, 0x8C, 0x00);
+pub const DARK_ORANGE: egui::Color32 = egui::Color32::from_rgb(0xFF, 0x8C, 0x00);
 
 /// Editor for a time of the form HH:MM:SS
 fn time_edit(ui: &mut egui::Ui, hms: &mut [u32; 3]) {
@@ -83,19 +83,6 @@ fn time_edit(ui: &mut egui::Ui, hms: &mut [u32; 3]) {
             );
         }
     });
-}
-
-/// Dialogue box for alerting the user about something. Returns whether the user
-/// acknowledged it.
-pub fn alert_dialog(ctx: &egui::Context, alert: &Alert) -> bool {
-    let (acknowledged, _) = modal(ctx, "alert_dialog", "Alert", 360.0, |ui| {
-        ui.add_space(8.0);
-        ui.vertical_centered(|ui| {
-            ui.label(egui::RichText::new(&alert.text).size(24.0));
-        });
-        button_row(ui, |ui| ui.button(alert.button.as_str()).clicked())
-    });
-    acknowledged
 }
 
 /// How big the logo is in the credits dialog, in points

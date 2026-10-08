@@ -97,6 +97,16 @@ struct Files {
     comp: DataFile,
 }
 
+/// Seconds set aside before the first calibration for the user to get things ready
+pub const USER_BUFFER: f64 = 30.0;
+
+/// The names of the data files (.md1 or .md2, based on observation type) of an
+/// observation called `name`
+pub fn data_file_names(obs_type: ObsType, name: &str) -> [String; 3] {
+    let extension = obs_type.file_extension();
+    ["a", "b", "comp"].map(|channel| format!("{name}_{channel}.{extension}"))
+}
+
 /// One of the three types of observation: Scan, Survey, or Spectrum.
 ///
 /// To interact with an observation, first set its properties using the `set_xxx()`
@@ -217,14 +227,28 @@ impl Observation {
     /// Name the observation and create its data files (.md1 or .md2, based on
     /// observation type) in `dir`
     pub fn set_name(&mut self, name: &str, dir: &Path) -> io::Result<()> {
-        let extension = self.obs_type.file_extension();
+        let [a, b, comp] = data_file_names(self.obs_type, name);
         self.files = Some(Files {
-            a: DataFile::new(dir, &format!("{name}_a.{extension}"))?,
-            b: DataFile::new(dir, &format!("{name}_b.{extension}"))?,
-            comp: DataFile::new(dir, &format!("{name}_comp.{extension}"))?,
+            a: DataFile::new(dir, &a)?,
+            b: DataFile::new(dir, &b)?,
+            comp: DataFile::new(dir, &comp)?,
         });
         self.name = name.to_owned();
         Ok(())
+    }
+
+    /// How long the calibration and background before the data take
+    pub fn preparation_duration(&self) -> f64 {
+        self.cal_dur + self.bg_dur
+    }
+
+    /// Where the telescope needs to be pointing when the observation begins. Surveys
+    /// begin below their range so that the first sweep covers all of it.
+    pub fn target_dec(&self) -> f64 {
+        match self.obs_type {
+            ObsType::Survey => self.min_dec - 2.0,
+            ObsType::Scan | ObsType::Spectrum => self.min_dec,
+        }
     }
 
     pub fn set_data_freq(&mut self, data_freq: u32) {
@@ -233,7 +257,7 @@ impl Observation {
 
     // Communication API
     pub fn communicate(&mut self, data_point: Option<&DataPoint>, timestamp: f64) -> Comm {
-        let user_start_time = self.start_time - (self.bg_dur + self.cal_dur + 30.0);
+        let user_start_time = self.start_time - self.preparation_duration() - USER_BUFFER;
 
         match self.state {
             State::Off => {
@@ -349,7 +373,15 @@ impl Observation {
         self.state_time_interval = (self.bg_start, self.bg_start + self.bg_dur);
     }
 
-    fn stop(&mut self, current_time: f64) {
+    /// End the observation and finish off its files. This is how every observation ends,
+    /// whether it got through all of its states or not.
+    pub fn stop(&mut self, current_time: f64) {
+        if self.state == State::Done {
+            return;
+        }
+        if self.state == State::Off {
+            self.obs_start = current_time; // Stopped before it ever began
+        }
         self.state = State::Done;
         self.end_time = current_time;
         self.state_time_interval = (-1.0, self.end_time);

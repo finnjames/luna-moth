@@ -13,9 +13,9 @@ use crate::core::{BASE_PERIOD, Core, MAX_STRIPCHART_SECONDS};
 use crate::dataq::{self, DataQ};
 use crate::deccalc::CAL_FILENAME;
 use crate::declinometer::Declinometer;
-use crate::dialogs::{self, DecDialog, ObsDialog, QuitChoice, RaDialog};
+use crate::dialogs::{self, DARK_ORANGE, DecDialog, ObsDialog, QuitChoice, RaDialog};
 use crate::logo;
-use crate::observation::ObsType;
+use crate::observation::{ObsType, State};
 
 // Basic time
 const STRIPCHART_PERIOD: Duration = Duration::from_micros(16_700); // = 60Hz
@@ -145,8 +145,10 @@ pub struct LunaMoth {
     credits_open: bool,
     quit_open: bool,
     quit_confirmed: bool,
-    /// How many alerts the user's attention has been called to
-    alerts_seen: u64,
+    /// Whether the user is being asked if they really want to stop the observation
+    confirming_stop: bool,
+    /// How many prompts the user's attention has been called to
+    prompts_seen: u64,
 
     // Images
     dish: egui::TextureHandle,
@@ -194,7 +196,8 @@ impl LunaMoth {
             credits_open: false,
             quit_open: false,
             quit_confirmed: false,
-            alerts_seen: 0,
+            confirming_stop: false,
+            prompts_seen: 0,
             dish: load_texture(ctx, "dish", include_bytes!("../assets/dish.png")),
             base: load_texture(ctx, "base", include_bytes!("../assets/base.png")),
             logo: load_logo(ctx),
@@ -205,13 +208,12 @@ impl LunaMoth {
         MAX_STRIPCHART_SECONDS - (110.0 / 6.0) * f64::from(self.stripchart_speed)
     }
 
-    fn any_dialog_open(&self, core: &Core) -> bool {
+    fn any_dialog_open(&self) -> bool {
         self.obs_dialog.is_some()
             || self.dec_dialog.is_some()
             || self.ra_dialog.is_some()
             || self.credits_open
             || self.quit_open
-            || core.current_alert().is_some()
     }
 
     /// Whether the action is available right now. Most things can't be done in the
@@ -355,18 +357,138 @@ impl LunaMoth {
         });
     }
 
-    fn controls(&mut self, ui: &mut egui::Ui, core: &mut Core) {
+    /// Anything that could ruin an observation, where it can't be missed. Returns what
+    /// the user chose to do about it, if anything.
+    fn hazards(ui: &mut egui::Ui, core: &Core) -> Option<Action> {
+        let mut action = None;
+        let hazard = |ui: &mut egui::Ui, text: &str| {
+            ui.label(
+                egui::RichText::new(text)
+                    .strong()
+                    .color(egui::Color32::BLACK),
+            );
+        };
+        for instrument in core.instruments_not_responding() {
+            hazard(
+                ui,
+                &format!("{instrument} is not responding: nothing is being recorded"),
+            );
+        }
+        if core.dataq_is_simulated() {
+            hazard(ui, "No DataQ: channel voltages are SIMULATED");
+        }
+        if core.declinometer_is_simulated() {
+            hazard(ui, "No declinometer: declination is SIMULATED");
+        }
+        if !core.dec_is_calibrated() {
+            ui.horizontal(|ui| {
+                hazard(ui, "Declination is not calibrated");
+                let calibrate = egui::Button::new("Calibrate...");
+                if ui
+                    .add_enabled(Self::is_enabled(Action::Dec, core), calibrate)
+                    .clicked()
+                {
+                    action = Some(Action::Dec);
+                }
+            });
+        }
+        action
+    }
+
+    fn has_hazards(core: &Core) -> bool {
+        core.dataq_is_simulated()
+            || core.declinometer_is_simulated()
+            || !core.dec_is_calibrated()
+            || !core.instruments_not_responding().is_empty()
+    }
+
+    /// Where the observation is at, and what the user has to do about it
+    fn observation_panel(&mut self, ui: &mut egui::Ui, core: &mut Core, current_time: f64) {
+        ui.label(egui::RichText::new(&core.message).size(20.0));
+        let Some(obs) = &core.obs else {
+            self.confirming_stop = false;
+            ui.label(egui::RichText::new("No observation running").color(GRAY));
+            return;
+        };
+        let title = format!("{} {}", obs.obs_type.capitalized(), obs.name);
+        let state = obs.state;
+        let target_dec = obs.target_dec();
+        let prompt = core.prompt().cloned();
+        let (progress, countdown) = core.obs_progress(current_time).unwrap_or_default();
+
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(title).strong());
+            right_aligned(ui, |ui| {
+                if !self.confirming_stop {
+                    self.confirming_stop = ui.button("Stop").clicked();
+                    return;
+                }
+                if ui.button("Keep going").clicked() {
+                    self.confirming_stop = false;
+                }
+                if ui.button("Yes, stop").clicked() {
+                    core.stop_observation(current_time);
+                    self.confirming_stop = false;
+                }
+                ui.label("Stop early?");
+            });
+        });
+        if core.obs.is_none() {
+            return; // Just got stopped
+        }
+
+        phase_timeline(ui, state, progress);
+        let status = match state {
+            _ if prompt.is_some() => "Waiting for you",
+            State::Off => "Calibration prompt",
+            State::Cal1 | State::Cal2 => "Calibrating",
+            State::Bg1 | State::Bg2 => "Taking background",
+            State::Waiting => "Waiting for the starting RA",
+            State::Data => "Taking data",
+            State::Done => "Done",
+        };
+        ui.horizontal(|ui| {
+            ui.label(status);
+            right_aligned(ui, |ui| {
+                ui.monospace(countdown);
+            });
+        });
+
+        let Some(prompt) = prompt else {
+            if state == State::Off {
+                let get_ready =
+                    format!("Get ready: move the telescope to {target_dec:.1}° declination");
+                ui.label(egui::RichText::new(get_ready).color(GRAY));
+            }
+            return;
+        };
+        // What the user has to do, and one big button for when they've done it
+        egui::Frame::group(ui.style())
+            .stroke(egui::Stroke::new(2.0, DARK_ORANGE))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                let numbered = prompt.instructions.len() > 1;
+                for (i, instruction) in prompt.instructions.iter().enumerate() {
+                    let text = if numbered {
+                        format!("{}. {instruction}", i + 1)
+                    } else {
+                        instruction.clone()
+                    };
+                    ui.label(egui::RichText::new(text).size(18.0).strong());
+                }
+                let button = egui::Button::new(egui::RichText::new(&prompt.button).size(20.0))
+                    .min_size(egui::vec2(ui.available_width(), 44.0));
+                if ui.add(button).clicked() {
+                    core.confirm_prompt(current_time);
+                }
+            });
+    }
+
+    fn controls(&mut self, ui: &mut egui::Ui, core: &mut Core, current_time: f64) {
         let readout = core.readout.clone();
 
-        group_box(ui, "Message", |ui| {
-            ui.label(egui::RichText::new(&core.message).size(20.0));
-            ui.add(egui::ProgressBar::new(readout.progress).text(readout.progress_label));
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Refresh rate:").color(GRAY));
-                right_aligned(ui, |ui| {
-                    ui.label(egui::RichText::new(readout.refresh).monospace().color(GRAY));
-                });
-            });
+        group_box(ui, "Observation", |ui| {
+            self.observation_panel(ui, core, current_time);
         });
 
         group_box(ui, "Data", |ui| {
@@ -375,6 +497,12 @@ impl LunaMoth {
             value_row(ui, "Channel A:", &readout.channel_a);
             value_row(ui, "Channel B:", &readout.channel_b);
             value_row(ui, "Sweep:", &readout.sweep);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Refresh rate:").color(GRAY));
+                right_aligned(ui, |ui| {
+                    ui.label(egui::RichText::new(readout.refresh).monospace().color(GRAY));
+                });
+            });
         });
 
         group_box(ui, "Strip chart", |ui| {
@@ -499,9 +627,6 @@ impl LunaMoth {
         if let Some(dialog) = &mut self.obs_dialog
             && !dialog.show(ctx, core, current_time)
         {
-            if !dialog.is_info() {
-                core.completed_one_calibration = false;
-            }
             self.obs_dialog = None;
         }
 
@@ -522,16 +647,11 @@ impl LunaMoth {
             self.credits_open = dialogs::credits_dialog(ctx, &self.logo);
         }
 
-        // Alerts go on top of everything but the quit confirmation
-        if let Some(alert) = core.current_alert().cloned() {
-            if core.alerts_announced != self.alerts_seen {
-                self.alerts_seen = core.alerts_announced;
-                let attention = egui::UserAttentionType::Critical;
-                ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(attention));
-            }
-            if dialogs::alert_dialog(ctx, &alert) {
-                core.dismiss_alert(current_time);
-            }
+        // Call attention to anything new that the user has to do
+        if core.prompts_raised != self.prompts_seen {
+            self.prompts_seen = core.prompts_raised;
+            let attention = egui::UserAttentionType::Critical;
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(attention));
         }
 
         if self.quit_open {
@@ -561,7 +681,7 @@ impl eframe::App for LunaMoth {
         }
 
         let mut action = None;
-        if !self.any_dialog_open(&core) {
+        if !self.any_dialog_open() {
             for candidate in Action::ALL {
                 let pressed = candidate
                     .shortcut()
@@ -575,6 +695,12 @@ impl eframe::App for LunaMoth {
         egui::Panel::top("menu_bar").show(ui, |ui| {
             action = self.menu_bar(ui, &core).or(action);
         });
+        if Self::has_hazards(&core) {
+            let frame = egui::Frame::new().fill(DARK_ORANGE).inner_margin(6.0);
+            egui::Panel::top("hazards").frame(frame).show(ui, |ui| {
+                action = Self::hazards(ui, &core).or(action);
+            });
+        }
         if self.mode == Mode::Testing {
             egui::Panel::bottom("testing_frame").show(ui, |ui| {
                 Self::testing_frame(ui, &mut core);
@@ -583,7 +709,7 @@ impl eframe::App for LunaMoth {
         egui::Panel::left("controls")
             .resizable(false)
             .exact_size(CONTROLS_WIDTH)
-            .show(ui, |ui| self.controls(ui, &mut core));
+            .show(ui, |ui| self.controls(ui, &mut core, current_time));
         egui::CentralPanel::default().show(ui, |ui| {
             self.stripchart(ui, &core, current_time);
         });
@@ -619,6 +745,52 @@ fn spawn_core_thread(core: Arc<Mutex<Core>>, running: Arc<AtomicBool>) {
             } else {
                 next_tick = now; // Fell behind; don't try to catch up
             }
+        }
+    });
+}
+
+/// Every phase of an observation in a row, filled in as far as it's gotten
+fn phase_timeline(ui: &mut egui::Ui, state: State, progress: f32) {
+    const PHASES: [&str; 6] = [
+        "Calibrate",
+        "Background",
+        "Wait",
+        "Data",
+        "Calibrate",
+        "Background",
+    ];
+    // Nothing has begun in `Off`, and everything is over in `Done`
+    let current = match state {
+        State::Off => None,
+        State::Cal1 => Some(0),
+        State::Bg1 => Some(1),
+        State::Waiting => Some(2),
+        State::Data => Some(3),
+        State::Cal2 => Some(4),
+        State::Bg2 => Some(5),
+        State::Done => Some(PHASES.len()),
+    };
+    ui.columns(PHASES.len(), |columns| {
+        for (i, (ui, phase)) in columns.iter_mut().zip(PHASES).enumerate() {
+            let filled = match current {
+                Some(current) if i < current => 1.0,
+                Some(current) if i == current => progress,
+                _ => 0.0,
+            };
+            // Progress bars are wider than a column unless they're told otherwise
+            let width = ui.available_width();
+            ui.add(
+                egui::ProgressBar::new(filled)
+                    .desired_width(width)
+                    .desired_height(8.0),
+            );
+            let mut label = egui::RichText::new(phase).small();
+            label = if current == Some(i) {
+                label.strong()
+            } else {
+                label.color(GRAY)
+            };
+            ui.vertical_centered(|ui| ui.label(label));
         }
     });
 }
@@ -660,7 +832,7 @@ mod tests {
     /// Set this to a directory to have the tests save screenshots there (needs a GPU)
     const SCREENSHOTS_VAR: &str = "LUNA_MOTH_SCREENSHOTS";
 
-    /// The app with simulated instruments, with the startup alert acknowledged
+    /// The app with simulated instruments
     fn harness(test_name: &str) -> (Harness<'static, LunaMoth>, PathBuf) {
         let dir = temp_data_dir(test_name);
         let core = Core::new(
@@ -678,9 +850,11 @@ mod tests {
         let mut harness = builder.build_eframe(|cc| LunaMoth::with_core(&cc.egui_ctx, core));
         harness.run_steps(2);
         screenshot(&mut harness, &format!("{test_name}-0-startup"));
-        harness.get_by_label("Dec must be calibrated");
-        click(&mut harness, "Got it");
-        assert!(harness.query_by_label("Dec must be calibrated").is_none());
+        // Nothing real is plugged in, and that can't be missed
+        harness.get_by_label("No DataQ: channel voltages are SIMULATED");
+        harness.get_by_label("No declinometer: declination is SIMULATED");
+        harness.get_by_label("Declination is not calibrated");
+        harness.get_by_label("No observation running");
         (harness, dir)
     }
 
@@ -738,9 +912,11 @@ mod tests {
         press(&mut harness, Key::T);
         assert_eq!(harness.state().mode, Mode::Normal);
 
-        click(&mut harness, "Next");
-        harness.get_by_label("Dec vals must be numbers");
-        screenshot(&mut harness, "ui-scan-1-error");
+        // Can't be started without a declination
+        harness.get_by_label("Enter a declination");
+        click(&mut harness, "Start Observation");
+        harness.get_by_label("New Scan");
+        screenshot(&mut harness, "ui-scan-1-incomplete");
         assert!(!dir.exists());
         click(&mut harness, "Cancel");
         assert!(harness.query_by_label("New Scan").is_none());
@@ -800,5 +976,58 @@ mod tests {
         screenshot(&mut harness, "ui-quit-2-credits");
         click(&mut harness, "Close");
         assert!(!harness.state().credits_open);
+    }
+
+    #[test]
+    fn walks_through_an_observation() {
+        let (mut harness, dir) = harness("ui-observation");
+        let core = Arc::clone(&harness.state().core);
+
+        // A spectrum that starts so soon that the calibration prompt comes right away
+        let start_time = clock::now() + 30.0;
+        let mut obs = crate::observation::Observation::new(ObsType::Spectrum);
+        obs.set_name("ngc7027", &dir).unwrap();
+        obs.set_start_and_end_times(start_time, start_time + 180.0);
+        obs.set_dec(42.0, 65535.0).unwrap();
+        lock(&core).start_observation(obs, clock::now());
+        harness.run_steps(2);
+        harness.get_by_label("Spectrum ngc7027");
+        assert!(harness.query_by_label("No observation running").is_none());
+
+        thread::sleep(Duration::from_millis(1500));
+        harness.run_steps(2);
+        harness.get_by_label("Waiting for you");
+        harness.get_by_label("1. Move the telescope to 42.0° declination");
+        harness.get_by_label("2. Set frequency to 1319.5MHz");
+        harness.get_by_label("3. Turn the calibration switches ON");
+        // Everything fits in the panel
+        let button = harness.get_by_label("Start calibration").rect();
+        assert!(button.right() < CONTROLS_WIDTH, "{button}");
+        screenshot(&mut harness, "ui-observation-1-prompt");
+        // The new observation is off limits while this one is running
+        press(&mut harness, Key::Num1);
+        assert!(harness.state().obs_dialog.is_none());
+
+        click(&mut harness, "Start calibration");
+        assert_eq!(lock(&core).obs.as_ref().unwrap().state, State::Cal1);
+        assert!(harness.query_by_label("Start calibration").is_none());
+        harness.get_by_label("Calibrating");
+        thread::sleep(Duration::from_millis(1500));
+        harness.run_steps(2);
+        screenshot(&mut harness, "ui-observation-2-calibrating");
+
+        // Stopping takes two clicks
+        click(&mut harness, "Stop");
+        harness.get_by_label("Stop early?");
+        click(&mut harness, "Keep going");
+        assert!(lock(&core).obs.is_some());
+        click(&mut harness, "Stop");
+        click(&mut harness, "Yes, stop");
+        assert!(lock(&core).obs.is_none());
+        harness.get_by_label("Spectrum stopped early");
+        harness.get_by_label("No observation running");
+        let contents = std::fs::read_to_string(dir.join("ngc7027_a.md1")).unwrap();
+        assert!(contents.contains("TELESCOPE: The Mighty Forty"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
