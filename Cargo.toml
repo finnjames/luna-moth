@@ -1,0 +1,17 @@
+[package]
+name = "luna-moth"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chrono = "0.4.45"
+eframe = "0.36.2"
+egui_plot = "0.37.0"
+fastrand = "2.5.0"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+resvg = { version = "0.48.1", default-features = false }
+rodio = { version = "0.22.2", default-features = false, features = ["playback", "wav"] }
+serialport = "4.10.1"
+
+[dev-dependencies]
+egui_kittest = { version = "0.36.2", features = ["wgpu", "eframe"] }
